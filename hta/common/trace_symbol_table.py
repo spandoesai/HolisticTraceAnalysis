@@ -142,10 +142,20 @@ class TraceSymbolTable:
         cudaMemcpyAsync_id = self.sym_index.get("cudaMemcpyAsync", -128)
         cudaMemsetAsync_id = self.sym_index.get("cudaMemsetAsync", -128)
 
+        hipLaunchKernel_id = self.sym_index.get("hipLaunchKernel", -128)
+        hipExtModuleLaunchKernel_id = self.sym_index.get(
+            "hipExtModuleLaunchKernel", -128
+        )
+        hipLaunchKernelExC_id = self.sym_index.get("hipExtModuleLaunchKernel", -128)
+        hipMemcpyAsync_id = self.sym_index.get("hipMemcpyWithStream", -128)
+        hipMemsetAsync_id = self.sym_index.get("hipMemsetAsync", -128)
+
         return (
             f"((name == {cudaMemsetAsync_id}) or (name == {cudaMemcpyAsync_id}) or "
-            f" (name == {cudaLaunchKernel_id}) or (name == {cudaLaunchKernelExC_id})"
-            f" or (name == {cuLaunchKernel_id})) and (index_correlation > 0)"
+            f"(name == {cudaLaunchKernel_id}) or (name == {cudaLaunchKernelExC_id}) or "
+            f"(name == {cuLaunchKernel_id}) or (name == {hipLaunchKernel_id}) or "
+            f"(name == {hipExtModuleLaunchKernel_id}) or (name == {hipLaunchKernelExC_id}) or "
+            f"(name == {hipMemcpyAsync_id}) or (name == {hipMemsetAsync_id})) and (index_correlation > 0)"
         )
 
 
