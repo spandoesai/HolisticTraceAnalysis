@@ -136,18 +136,27 @@ class TraceSymbolTable:
     def get_runtime_launch_events_query(self) -> str:
         """Returns a SQL query you can pass to trace dataframe query()
         to filter events that are CUDA runtime kernel and memcpy launches."""
-        cudaLaunchKernel_id = self.sym_index.get("cudaLaunchKernel", self.NULL)
-        cudaLaunchKernelExC_id = self.sym_index.get("cudaLaunchKernelExC", self.NULL)
-        cuLaunchKernel_id = self.sym_index.get("cuLaunchKernel", self.NULL)
-        cudaMemcpyAsync_id = self.sym_index.get("cudaMemcpyAsync", self.NULL)
-        cudaMemsetAsync_id = self.sym_index.get("cudaMemsetAsync", self.NULL)
-        mtiaLaunchKernel_id = self.sym_index.get(
-            "runFunction - job_prep_and_submit_for_execution", self.NULL
+        
+        cudaLaunchKernel_id = self.sym_index.get("cudaLaunchKernel", -128)
+        cudaLaunchKernelExC_id = self.sym_index.get("cudaLaunchKernelExC", -128)
+        cuLaunchKernel_id = self.sym_index.get("cuLaunchKernel", -128)
+        cudaMemcpyAsync_id = self.sym_index.get("cudaMemcpyAsync", -128)
+        cudaMemsetAsync_id = self.sym_index.get("cudaMemsetAsync", -128)
+
+        hipLaunchKernel_id = self.sym_index.get("hipLaunchKernel", -128)
+        hipExtModuleLaunchKernel_id = self.sym_index.get(
+            "hipExtModuleLaunchKernel", -128
         )
+        hipLaunchKernelExC_id = self.sym_index.get("hipExtModuleLaunchKernel", -128)
+        hipMemcpyAsync_id = self.sym_index.get("hipMemcpyWithStream", -128)
+        hipMemsetAsync_id = self.sym_index.get("hipMemsetAsync", -128)
+
         return (
             f"((name == {cudaMemsetAsync_id}) or (name == {cudaMemcpyAsync_id}) or "
-            f" (name == {cudaLaunchKernel_id}) or (name == {cudaLaunchKernelExC_id})"
-            f" or (name == {cuLaunchKernel_id}) or (name == {mtiaLaunchKernel_id})) and (index_correlation > 0)"
+            f"(name == {cudaLaunchKernel_id}) or (name == {cudaLaunchKernelExC_id}) or "
+            f"(name == {cuLaunchKernel_id}) or (name == {hipLaunchKernel_id}) or "
+            f"(name == {hipExtModuleLaunchKernel_id}) or (name == {hipLaunchKernelExC_id}) or "
+            f"(name == {hipMemcpyAsync_id}) or (name == {hipMemsetAsync_id})) and (index_correlation > 0)"
         )
 
 
