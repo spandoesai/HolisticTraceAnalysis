@@ -47,6 +47,10 @@ class TraceAnalysisTestCase(unittest.TestCase):
         )
         cls.rank_non_gpu_t = TraceAnalysis(trace_dir=cls.rank_non_gpu_trace_dir)
         cls.h100_trace_t = TraceAnalysis(trace_dir=cls.h100_trace_dir)
+        cls.mtia_single_rank_dir: str = os.path.join(
+            cls.base_data_dir, "mtia_trace_single_rank/"
+        )
+        cls.mtia_single_rank_trace_t = TraceAnalysis(trace_dir=cls.mtia_single_rank_dir)
 
     def setUp(self):
         self.overlaid_trace_dir = self.base_data_dir
@@ -119,6 +123,17 @@ class TraceAnalysisTestCase(unittest.TestCase):
         self.assertEqual(row["cpu_duration"].item(), 9)
         self.assertEqual(row["gpu_duration"].item(), 3)
         self.assertEqual(row["launch_delay"].item(), 20)
+
+    def test_get_mtia_kernel_launch_stats_inference_single_rank(self):
+        dataframe_list = self.mtia_single_rank_trace_t.get_cuda_kernel_launch_stats(
+            visualize=False
+        )
+        rank_0_df = dataframe_list[0]
+        row = rank_0_df[rank_0_df["correlation"] == 423]
+
+        self.assertEqual(row["cpu_duration"].item(), 435.200)
+        self.assertEqual(row["gpu_duration"].item(), 124.768)
+        self.assertEqual(row["launch_delay"].item(), 340.291)
 
     def test_get_cuda_kernel_launch_stats_for_h100(self):
         dataframe_dict = self.h100_trace_t.get_cuda_kernel_launch_stats(
@@ -217,6 +232,26 @@ class TraceAnalysisTestCase(unittest.TestCase):
             delta=0.01,
         )
 
+    def test_mtia_temporal_breakdown(self):
+        idle_time = self.mtia_single_rank_trace_t.get_temporal_breakdown(
+            visualize=False
+        )
+        self.assertAlmostEqual(
+            idle_time.iloc[0]["idle_time_pctg"],
+            round((5649476.0 * 100) / 13328071, 3),
+            delta=0.01,
+        )
+        self.assertAlmostEqual(
+            idle_time.iloc[0]["compute_time_pctg"],
+            round((7305597.0 * 100 / 13328071), 3),
+            delta=0.01,
+        )
+        self.assertAlmostEqual(
+            idle_time.iloc[0]["non_compute_time_pctg"],
+            round(372998.0 * 100 / 13328071, 3),
+            delta=0.01,
+        )
+
     def test_get_gpu_kernel_breakdown(self):
         (
             kernel_type_breakdown,
@@ -232,7 +267,22 @@ class TraceAnalysisTestCase(unittest.TestCase):
         self.assertEqual(kernel_breakdown.iloc[151]["kernel_type"], "MEMORY")
         self.assertEqual(kernel_breakdown.iloc[151]["sum (us)"], 1064)
 
-    def test_get_queue_length_summary(self):
+    def test_get_mtia_kernel_breakdown(self):
+        (
+            kernel_type_breakdown,
+            kernel_breakdown,
+        ) = self.mtia_single_rank_trace_t.get_gpu_kernel_breakdown(
+            visualize=False, include_memory_kernels=True
+        )
+
+        self.assertEqual(kernel_type_breakdown.iloc[0]["kernel_type"], "COMPUTATION")
+        self.assertEqual(kernel_type_breakdown.iloc[0]["sum"], 7305597)
+        self.assertEqual(kernel_breakdown.iloc[0]["kernel_type"], "COMPUTATION")
+        self.assertEqual(kernel_breakdown.iloc[0]["sum (us)"], 77283.0)
+        self.assertEqual(kernel_breakdown.iloc[11]["kernel_type"], "MEMORY")
+        self.assertEqual(kernel_breakdown.iloc[11]["sum (us)"], 400892.0)
+
+    def test_get_queue_length_stats(self):
         qd_summary = self.vision_transformer_t.get_queue_length_summary(ranks=[0])
         streams = qd_summary.index.to_list()
         self.assertEqual(streams, list(zip([0] * 6, [7, 20, 24, 26, 28, 30])))
@@ -255,6 +305,66 @@ class TraceAnalysisTestCase(unittest.TestCase):
                 places=2,
                 msg=f"Stream 7 stats mismatch key={key}",
             )
+
+        queue_len_ts_dict = self.vision_transformer_t.get_queue_length_time_series()
+        queue_full_df = self.vision_transformer_t.get_time_spent_blocked_on_full_queue(
+            queue_len_ts_dict, max_queue_length=400  # Just a hack for testing
+        )
+        self.assertEqual(len(queue_full_df), 1)
+        self.assertAlmostEqual(
+            queue_full_df.loc[0]["duration_at_max_queue_length"],
+            2300.0,
+            msg=f"queue_full_df = {queue_full_df}",
+        )
+        self.assertAlmostEqual(
+            queue_full_df.loc[0]["relative_duration_at_max_queue_length"],
+            0.001129,
+            places=5,
+            msg=f"queue_full_df = {queue_full_df}",
+        )
+
+    def test_get_mtia_queue_length_stats(self):
+        qd_summary = self.mtia_single_rank_trace_t.get_queue_length_summary(ranks=[0])
+        streams = qd_summary.index.to_list()
+        self.assertEqual(streams, list(zip([0] * 2, [1, 102])))
+
+        stream102_stats = qd_summary.loc[0, 102]["queue_length"].to_dict()
+        expected_stats = {
+            "count": 6.0,
+            "mean": 0.5,
+            "std": 0.547723,
+            "min": 0.0,
+            "25%": 0.0,
+            "50%": 0.5,
+            "75%": 1.0,
+            "max": 1.0,
+        }
+        for key, expval in expected_stats.items():
+            self.assertAlmostEqual(
+                stream102_stats[key],
+                expval,
+                places=2,
+                msg=f"Stream 102 stats mismatch key={key}",
+            )
+
+        queue_len_ts_dict = self.mtia_single_rank_trace_t.get_queue_length_time_series()
+        queue_full_df = (
+            self.mtia_single_rank_trace_t.get_time_spent_blocked_on_full_queue(
+                queue_len_ts_dict, max_queue_length=1  # Just a hack for testing
+            )
+        )
+        self.assertEqual(len(queue_full_df), 1)
+        self.assertAlmostEqual(
+            queue_full_df.loc[0]["duration_at_max_queue_length"],
+            1060.0,
+            msg=f"queue_full_df = {queue_full_df}",
+        )
+        self.assertAlmostEqual(
+            queue_full_df.loc[0]["relative_duration_at_max_queue_length"],
+            0.000079,
+            places=5,
+            msg=f"queue_full_df = {queue_full_df}",
+        )
 
     @patch.object(hta.common.trace.Trace, "write_raw_trace")
     def test_generate_trace_with_counters(self, mock_write_trace):
@@ -341,6 +451,39 @@ class TraceAnalysisTestCase(unittest.TestCase):
                 stream7_stats[key],
                 expval,
                 msg=f"Stream 7 idle stats mismatch key={key}",
+            )
+
+    def test_get_mtia_idle_time_breakdown(self):
+        (
+            idle_time_df,
+            idle_interval_df,
+        ) = self.mtia_single_rank_trace_t.get_idle_time_breakdown(
+            ranks=[0], visualize=False, show_idle_interval_stats=True
+        )
+        ranks = idle_time_df["rank"].unique()
+        streams = idle_time_df.stream.unique()
+        idle_categories = idle_time_df.idle_category.unique()
+
+        self.assertEqual(set(ranks), {0})
+        self.assertEqual(set(streams), {1, 102})
+        self.assertEqual(set(idle_categories), {"host_wait", "kernel_wait", "other"})
+
+        # Ratios sum up to 1.0, 2 streams x 1 ranks = 2.0
+        self.assertAlmostEqual(idle_time_df.idle_time_ratio.sum(), 2.0)
+
+        stream1_stats = idle_time_df[idle_time_df.stream == 1].iloc[0].to_dict()
+        expected_stats = {
+            "idle_category": "host_wait",
+            "idle_time": 417937.0,
+            "stream": 1,
+            "idle_time_ratio": 0.07,
+            "rank": 0,
+        }
+        for key, expval in expected_stats.items():
+            self.assertAlmostEqual(
+                stream1_stats[key],
+                expval,
+                msg=f"Stream 1 idle stats mismatch key={key}",
             )
 
 

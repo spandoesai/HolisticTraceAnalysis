@@ -7,11 +7,18 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Tuple
 
+import hta.configs.env_options as hta_options
 from hta.analyzers.critical_path_analysis import (
     CPEdge,
     CPEdgeType,
     CriticalPathAnalysis,
     restore_cpgraph,
+)
+from hta.common.trace_parser import (
+    _auto_detect_parser_backend,
+    get_default_trace_parsing_backend,
+    ParserBackend,
+    set_default_trace_parsing_backend,
 )
 from hta.trace_analysis import TraceAnalysis
 
@@ -41,6 +48,7 @@ class CriticalPathAnalysisTestCase(unittest.TestCase):
         critical_path_trace_dir5: str = os.path.join(
             self.base_data_dir, "ns_resolution_trace"
         )
+        self.ns_resolution_trace_dir = critical_path_trace_dir5
         self.ns_resolution_trace = TraceAnalysis(trace_dir=critical_path_trace_dir5)
 
     def test_critical_path_analysis(self):
@@ -76,7 +84,7 @@ class CriticalPathAnalysisTestCase(unittest.TestCase):
         self.assertEqual(get_node_name(clamp_min_idx), "aten::clamp_min_")
         self.assertEqual(get_node_name(cuda_launch_idx), "cudaLaunchKernel")
 
-        expected_node_ids = [(32, 33), (34, 35), (36, 37)]
+        expected_node_ids = [(57, 62), (58, 61), (59, 60)]
 
         def check_nodes(ev_idx: int) -> Tuple[int, int]:
             start_node, end_node = cp_graph.get_nodes_for_event(ev_idx)
@@ -247,7 +255,7 @@ class CriticalPathAnalysisTestCase(unittest.TestCase):
                 cpgraph_edges = (
                     cp_graph.edges[u, v]["object"] for (u, v) in cp_graph.edges
                 )
-                if not CriticalPathAnalysis._show_zero_weight_launch_edges():
+                if not hta_options.critical_path_show_zero_weight_launch_edges():
                     cpgraph_edges = filter(
                         lambda e: not CriticalPathAnalysis._is_zero_weight_launch_edge(
                             e
@@ -534,11 +542,23 @@ class CriticalPathAnalysisTestCase(unittest.TestCase):
         annotation = "ProfilerStep"
         instance_id = 1
 
+        def test():
+            cp_graph, success = critical_path_t.critical_path_analysis(
+                rank=0, annotation=annotation, instance_id=instance_id
+            )
+            self.assertTrue(success)
+
         critical_path_t = self.ns_resolution_trace
-        cp_graph, success = critical_path_t.critical_path_analysis(
-            rank=0, annotation=annotation, instance_id=instance_id
-        )
-        self.assertTrue(success)
+        test()
+
+        if _auto_detect_parser_backend() != ParserBackend.JSON:
+            old_backend = get_default_trace_parsing_backend()
+            set_default_trace_parsing_backend(ParserBackend.IJSON_BATCH_AND_COMPRESS)
+
+            critical_path_t = TraceAnalysis(trace_dir=self.ns_resolution_trace_dir)
+            test()
+
+            set_default_trace_parsing_backend(old_backend)
 
 
 if __name__ == "__main__":

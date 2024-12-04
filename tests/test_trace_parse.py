@@ -21,7 +21,8 @@ from hta.common.trace_parser import (
 )
 from hta.configs.parser_config import AVAILABLE_ARGS, ParserConfig
 
-EXPECTED_META_VISION_TRANFORMER: Dict[str, Any] = {
+JSON = Dict[str, Any]
+EXPECTED_META_VISION_TRANFORMER: JSON = {
     "schemaVersion": 1,
     "distributedInfo": {"backend": "nccl", "rank": 0, "world_size": 64},
     "deviceProperties": [
@@ -41,7 +42,26 @@ EXPECTED_META_VISION_TRANFORMER: Dict[str, Any] = {
             "numSms": 80,
             "sharedMemPerBlockOptin": 98304,
         },
+        {},  # omitting the actual device property for brevity.
+        {},
+        {},
+        {},
+        {},
+        {},
+        {},
     ],
+}
+
+EXPECTED_META_CPU_ONLY_TRACE: JSON = {
+    "deviceProperties": [],
+    "distributedInfo": {
+        "backend": "gloo",
+        "pg_config": None,
+        "pg_count": 10,
+        "rank": 34,
+        "world_size": 300,
+    },
+    "schemaVersion": 1,
 }
 
 GROUND_TRUTH_CACHE: Dict[str, pd.DataFrame] = {}
@@ -78,6 +98,9 @@ class TraceParseTestCase(unittest.TestCase):
         inference_trace_dir: str = "tests/data/inference_single_rank"
         vision_transformer_rank_0_file: str = "rank-0.json.gz"
         inference_rank_0_file: str = "inference_rank_0.json.gz"
+        inference_trace_files = [
+            os.path.join(inference_trace_dir, inference_rank_0_file)
+        ]
         max_ranks = 8
 
         # Trace parser for vision transformer
@@ -89,7 +112,9 @@ class TraceParseTestCase(unittest.TestCase):
             vision_transformer_trace_dir, vision_transformer_rank_0_file
         )
         # Trace parser for inference
-        cls.inference_t: Trace = Trace(trace_dir=inference_trace_dir)
+        cls.inference_t: Trace = Trace(
+            trace_files=inference_trace_files, trace_dir=os.getcwd()
+        )
         cls.inference_t.parse_traces(max_ranks=max_ranks, use_multiprocessing=True)
         cls.inference_raw_df = prepare_ground_truth_df(
             inference_trace_dir, inference_rank_0_file
@@ -150,10 +175,10 @@ class TraceParseTestCase(unittest.TestCase):
                 df.loc[valid_gpu_kernels.index, "index_correlation"]
             ]
             gpu_kernels_per_iteration = (
-                valid_gpu_kernels.groupby("iteration")["index"].agg("count").to_dict()
+                valid_gpu_kernels.groupby("iteration")["index"].count().to_dict()
             )
             correlated_cpu_ops_per_iteration = (
-                correlated_cpu_ops.groupby("iteration")["index"].agg("count").to_dict()
+                correlated_cpu_ops.groupby("iteration")["index"].count().to_dict()
             )
 
             self.assertTrue("iteration" in df.columns)
@@ -167,6 +192,9 @@ class TraceParseTestCase(unittest.TestCase):
         exp_meta = EXPECTED_META_VISION_TRANFORMER
         self.assertEqual(trace_meta["schemaVersion"], exp_meta["schemaVersion"])
         self.assertEqual(trace_meta["distributedInfo"], exp_meta["distributedInfo"])
+        self.assertEqual(
+            len(trace_meta["deviceProperties"]), len(exp_meta["deviceProperties"])
+        )
         self.assertEqual(
             trace_meta["deviceProperties"][0], exp_meta["deviceProperties"][0]
         )
@@ -204,6 +232,9 @@ class TraceParseIjsonOthersTestCase(unittest.TestCase):
     def setUpClass(cls):
         cls.inference_trace_dir: str = "tests/data/critical_path/alexnet"
         cls.vision_transformer_trace_dir: str = "tests/data/vision_transformer"
+        cls.cpu_only_trace_path: str = (
+            "tests/data/cpu_only/rank-34.Jul_15_10_52_41.1074.pt.trace.json.gz"
+        )
 
     def test_ijson_parser(self):
         set_default_trace_parsing_backend(ParserBackend.IJSON)
@@ -232,19 +263,33 @@ class TraceParseIjsonOthersTestCase(unittest.TestCase):
         self.assertEqual(len(inference_t.traces), 1)
         set_default_trace_parsing_backend(ParserBackend.JSON)
 
-    def test_ijson_metadata_reader(self):
-        trace_file_path = self.vision_transformer_trace_dir + "/rank-0.json.gz"
+    def _ijson_metadata_test_common(self, trace_file_path: str, exp_meta: JSON):
         trace_meta = {}
         with _open_trace_file(trace_file_path) as fh:
             trace_meta = parse_metadata_ijson(fh)
         # print(trace_meta)
 
-        exp_meta = EXPECTED_META_VISION_TRANFORMER
         self.assertEqual(trace_meta["schemaVersion"], exp_meta["schemaVersion"])
         self.assertEqual(trace_meta["distributedInfo"], exp_meta["distributedInfo"])
         self.assertEqual(
-            trace_meta["deviceProperties"][0], exp_meta["deviceProperties"][0]
+            len(trace_meta["deviceProperties"]), len(exp_meta["deviceProperties"])
         )
+        if len(trace_meta["deviceProperties"]) > 0:
+            self.assertEqual(
+                trace_meta["deviceProperties"][0], exp_meta["deviceProperties"][0]
+            )
+
+    def test_ijson_metadata_reader_basic(self):
+        trace_file_path = self.vision_transformer_trace_dir + "/rank-0.json.gz"
+        self._ijson_metadata_test_common(
+            trace_file_path, EXPECTED_META_VISION_TRANFORMER
+        )
+
+    def test_ijson_metadata_reader_corner_cases(self):
+        # This trace has an empty deviceProperties [] array as it runs on CPU.
+        # It also has a large pg_config array in distributedInfo.
+        trace_file_path = self.cpu_only_trace_path
+        self._ijson_metadata_test_common(trace_file_path, EXPECTED_META_CPU_ONLY_TRACE)
 
     # @mock.patch('ijson.backend')
     # def test_optimal_backend_detection(self, mock_backend) -> None:
@@ -256,14 +301,19 @@ class TraceParseIjsonOthersTestCase(unittest.TestCase):
 
 class TraceParseConfigTestCase(unittest.TestCase):
     def setUp(self) -> None:
+        # Trace parser test file for nccl fields
         resnet_nccl_trace: str = "tests/data/nccl_parser_config"
-        # Trace parser for nccl fields
         self.resnet_nccl_t: Trace = Trace(trace_dir=resnet_nccl_trace)
+
+        # Trace parser test file for Triton fields
+        triton_trace: str = "tests/data/triton_example"
+        self.triton_t: Trace = Trace(trace_dir=triton_trace)
 
         # Parse all nccl fields in the test
         custom_cfg = ParserConfig(ParserConfig.get_minimum_args())
         custom_cfg.add_args(
             [spec for (arg, spec) in AVAILABLE_ARGS.items() if arg.startswith("nccl")]
+            + [AVAILABLE_ARGS["cpu_op::kernel_backend"]]
         )
         ParserConfig.set_default_cfg(custom_cfg)
 
@@ -295,6 +345,31 @@ class TraceParseConfigTestCase(unittest.TestCase):
         self.assertEqual(nccl_data["process_group_name"], "0")
         self.assertEqual(nccl_data["process_group_desc"], "default_pg")
         self.assertEqual(nccl_data["process_group_ranks"], "[0, 1]")
+
+    def test_triton_trace(self) -> None:
+        """Tests if a file with Triton/torch.compile() is parsed correctly,
+        and we can obtain special attributes from the cpu ops tha launch Triton kernels
+        """
+        self.triton_t.parse_traces(max_ranks=1, use_multiprocessing=False)
+        self.triton_t.decode_symbol_ids(use_shorten_name=False)
+
+        trace_df = self.triton_t.get_trace(0)
+        self.assertGreater(len(trace_df), 0)
+        self.assertTrue("kernel_backend" in trace_df.columns)
+        self.assertTrue("kernel_hash" in trace_df.columns)
+
+        triton_cpu_ops = trace_df[trace_df.kernel_backend.ne("")]
+        # We have one triton cpu op
+        self.assertEqual(len(triton_cpu_ops), 1)
+
+        triton_op = triton_cpu_ops.iloc[0].to_dict()
+        self.assertEqual(triton_op["s_name"], "triton_poi_fused_add_cos_sin_0")
+        self.assertEqual(triton_op["s_cat"], "cpu_op")
+        self.assertEqual(triton_op["kernel_backend"], "triton")
+        self.assertEqual(
+            triton_op["kernel_hash"],
+            "cqaokwf2bph4egogzevc22vluasiyuui4i54zpemp6knbsggfbuu",
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -12,13 +12,13 @@ import re
 import sys
 import time
 import tracemalloc
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
 import pandas as pd
 
-from hta.common.trace_file import get_trace_files
+from hta.common.trace_file import create_rank_to_trace_dict, get_trace_files
 from hta.common.trace_filter import CPUOperatorFilter, GPUKernelFilter
 from hta.common.trace_parser import parse_trace_dataframe, parse_trace_dict
 from hta.common.trace_symbol_table import (
@@ -311,14 +311,15 @@ class Trace:
 
     def __init__(
         self,
-        trace_files: Optional[Dict[int, str]] = None,
+        trace_files: Union[List[str], Optional[Dict[int, str]]] = None,
         trace_dir: str = DEFAULT_TRACE_DIR,
     ) -> None:
         """
         The constructor of a Trace object.
         Args:
-            trace_files: Dict[int, str] : a map from rank to trace file names. The trace file names can be either
-                relative to the path `trace_path` or absolute file paths.
+            trace_files: Union[List[str], Dict[int, str] : either a list of trace file names or a map from rank to trace file names.
+                When a list is provided, HTA will infer the ranks by reading the trace file metadata.
+                The trace file names can be either relative to the path `trace_path` or absolute file paths.
             trace_dir (str) : a path used to derive `trace_path = normalize_path(trace_dir)`.
 
         Raises:
@@ -326,9 +327,22 @@ class Trace:
         """
         self.trace_path: str = normalize_path(trace_dir)
         logger.info(f"{self.trace_path}")
-        self.trace_files: Dict[int, str] = (
-            trace_files if trace_files is not None else get_trace_files(self.trace_path)
-        )
+
+        self.trace_files: Dict[int, str]
+        if trace_files is None:
+            self.trace_files = get_trace_files(self.trace_path)
+        elif isinstance(trace_files, dict):
+            self.trace_files = trace_files
+        elif isinstance(trace_files, list):
+            ok, self.trace_files = create_rank_to_trace_dict(trace_files)
+            if not ok:
+                logger.warning("failed to create rank to trace map")
+        else:
+            logger.error(
+                f"Unsupported type for trace_files = {trace_files}, should be list or dict"
+            )
+            return
+
         logger.debug(self.trace_files)
         self.traces: Dict[int, pd.DataFrame] = {}
         self.symbol_table = TraceSymbolTable()
@@ -345,11 +359,19 @@ class Trace:
             logger.debug(f"trace_files[{rank}] = {trace_file}")
         self.is_parsed = False
 
-    def load_traces(self, include_last_profiler_step: Optional[bool] = False) -> None:
+    def load_traces(
+        self,
+        include_last_profiler_step: Optional[bool] = False,
+        use_multiprocessing: bool = True,
+        use_memory_profiling: bool = True,
+    ) -> None:
         if self.is_parsed:
             logger.warning("Traces are already parsed and loaded!")
             return
-        self.parse_traces()
+        self.parse_traces(
+            use_multiprocessing=use_multiprocessing,
+            use_memory_profiling=use_memory_profiling,
+        )
         self.align_and_filter_trace(include_last_profiler_step)
         for rank, df in self.traces.items():
             df = self.traces[rank].set_index("index", drop=False)
@@ -382,7 +404,10 @@ class Trace:
                 )
 
     def parse_multiple_ranks(
-        self, ranks: List[int], use_multiprocessing: bool = True
+        self,
+        ranks: List[int],
+        use_multiprocessing: bool = True,
+        use_memory_profiling: bool = True,
     ) -> None:
         """
         Parse the trace for a given rank.
@@ -390,6 +415,7 @@ class Trace:
         Args:
             ranks (List[int]) : a list of integers representing the ranks of multiple trainers.
             use_multiprocessing (bool) : whether the parser using multiprocessing or not.
+            use_memory_profiling (bool): whether the parser memory profiles or not.
         """
         logger.debug(
             f"entering {sys._getframe().f_code.co_name}(ranks={ranks}, use_multiprocessing={use_multiprocessing})"
@@ -413,13 +439,13 @@ class Trace:
             num_procs = min(mp.cpu_count(), len(ranks))
             if len(ranks) <= 8:
                 num_procs = min(len(ranks), mp.cpu_count())
-            else:
+            elif use_memory_profiling:
                 tracemalloc.start()
                 parse_trace_file(trace_paths[0])
                 current, peak = tracemalloc.get_traced_memory()
                 tracemalloc.stop()
                 num_procs = get_mp_pool_size(peak, len(ranks))
-            logger.debug(f"using {num_procs} processes for parsing.")
+            logger.info(f"using {num_procs} processes for parsing.")
 
             with mp.get_context("fork").Pool(num_procs) as pool:
                 results = pool.map(parse_trace_file, trace_paths)
@@ -454,6 +480,7 @@ class Trace:
         self,
         max_ranks: int = -1,
         use_multiprocessing: bool = True,
+        use_memory_profiling: bool = True,
     ) -> None:
         """
         Parse up to <max_rank> traces.
@@ -461,7 +488,7 @@ class Trace:
         Args:
             max_ranks (int): how many rank's traces to parse. Default value `-1` implies parsing all ranks.
             use_multiprocessing (bool) : whether the parser using multiprocessing or not.
-
+            use_memory_profiling (bool): whether the parser memory profiles or not.
         Effects:
             This function will parse the traces and save the parsed data into `self.traces`.
         """
@@ -474,7 +501,10 @@ class Trace:
         logger.info(f"ranks={ranks}")
 
         if len(ranks) > 0:
-            self.parse_multiple_ranks(ranks, use_multiprocessing and len(ranks) > 1)
+            self.parse_multiple_ranks(
+                ranks, use_multiprocessing and len(ranks) > 1, use_memory_profiling
+            )
+
             self.is_parsed = True
         else:
             logger.error("The list of ranks to be parsed is empty.")
@@ -497,6 +527,12 @@ class Trace:
         """Get the list of (sorted) ranks included in this trace."""
         return sorted(self.traces.keys())
 
+    def _get_first_rank(self, rank: Optional[int] = None) -> int:
+        if rank is None:
+            _ranks = self.get_ranks()
+            rank = _ranks[0] if len(_ranks) > 0 else -1
+        return rank
+
     def get_iterations(self, rank: Optional[int] = None) -> List[int]:
         """Get the list of iterations for a given rank.
 
@@ -508,15 +544,26 @@ class Trace:
             A list of iteration IDs for the given rank.
             Return an empty list when the rank is invalid or column "iteration" does not exists.
         """
-        if rank is None:
-            _ranks = self.get_ranks()
-            rank = _ranks[0] if len(_ranks) > 0 else -1
+        rank = self._get_first_rank(rank)
 
         if rank in self.get_ranks():
             df = self.traces[rank]
             if "iteration" in df.columns:
                 return sorted([i for i in df["iteration"].unique() if i >= 0])
         return []
+
+    def get_trace_duration(self, rank: Optional[int] = None) -> int:
+        """Get the duration of specified rank.
+
+        Args:
+            rank (Optional[int]): a rank
+                when rank is None, use the first item of the list returned by self.get_ranks().
+
+        Returns: duration of trace (int)
+        """
+        rank = self._get_first_rank(rank)
+        trace_df = self.get_trace(rank)
+        return trace_df.ts.max() - trace_df.ts.min()
 
     def get_trace(self, rank: int) -> pd.DataFrame:
         """

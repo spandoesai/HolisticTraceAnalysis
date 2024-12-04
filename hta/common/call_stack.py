@@ -9,10 +9,12 @@ from enum import Enum
 from time import perf_counter
 from typing import Callable, Dict, List, NamedTuple, Optional
 
+import hta.configs.env_options as hta_options
+
 import numpy as np
 import pandas as pd
-
 from hta.common.trace import Trace
+from hta.common.trace_filter import Filter
 
 NON_EXISTENT_NODE_INDEX = -2
 NULL_NODE_INDEX = -1
@@ -195,12 +197,19 @@ class CallStackGraph:
         nodes (Dict[int, node]): a map from a trace entity's index to a CallStackNode object.
         device_type (DeviceType) : what type of device that the call stack resides.
         correlations (pd.Series) : a Series that maps a node index to the index of a correlated node.
+        depth (pd.Series) : a Series that maps a node index to the depth of the node.
+        filter_func (Callable) : used to preprocess the trace events and filter events out. Please see filters in hta/common/trace_filter.py for details.
 
     Notes:
     + Because the kernels on a GPU has only one level, we don't construct a call stack for GPU kernels.
     """
 
-    def __init__(self, df: pd.DataFrame, identity: CallStackIdentity) -> None:
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        identity: CallStackIdentity,
+        filter_func: Optional[Filter] = None,
+    ) -> None:
         """Construct an empty graph."""
         self.df = df
         self.identity: CallStackIdentity = identity
@@ -208,6 +217,7 @@ class CallStackGraph:
         self.nodes: Dict[int, CallStackNode] = {}
         self.correlations: pd.Series = None
         self.depth: pd.Series = None
+        self.filter_func: Optional[Filter] = filter_func
         self._construct_call_stack_graph(df)
         self._compute_depth()
 
@@ -239,7 +249,10 @@ class CallStackGraph:
         self.nodes.clear()
         self.nodes[NULL_NODE_INDEX] = CallStackNode(NULL_NODE_INDEX, -1, [])
         events = []
-        df = df[["index", "ts", "dur"]].copy()
+        if self.filter_func is not None:
+            df = self.filter_func(df)[["index", "ts", "dur"]].copy()
+        else:
+            df = df[["index", "ts", "dur"]].copy()
         df["dur"] = np.maximum(df["dur"], 0)
         df["end"] = df["ts"] + df["dur"].astype(int)
 
@@ -443,12 +456,18 @@ class CallGraph:
         mapping (pd.DataFrame) : the mapping from CallStackIdentity to CallStackGraph using a DataFrame
     """
 
-    def __init__(self, trace: Trace, ranks: Optional[List[int]] = None) -> None:
+    def __init__(
+        self,
+        trace: Trace,
+        ranks: Optional[List[int]] = None,
+        filter_func: Optional[Filter] = None,
+    ) -> None:
         """Construct a CallGraph from a Trace object <trace_data>
 
         Args:
             trace (Trace): the trace data used to construct this CallGraph object.
             ranks (List[int]) : filter the traces using the given set of ranks. Using all ranks if None.
+            filter_func (Callable) : used to preprocess the trace events and filter events out. Please see filters in hta/common/trace_filter.py for details.
         Raises:
             ValueError: the trace data is invalid.
         """
@@ -457,14 +476,17 @@ class CallGraph:
         self.call_stacks: List[CallStackGraph] = []
 
         _ranks = [k for k in trace.get_all_traces()] if ranks is None else ranks
-        self._construct_call_graph(_ranks)
+        self._construct_call_graph(_ranks, filter_func)
 
-    def _construct_call_graph(self, ranks: List[int]) -> None:
+    def _construct_call_graph(
+        self, ranks: List[int], filter_func: Optional[Filter]
+    ) -> None:
         """
         Construct the call graph from the traces of a distributed training job.
 
         Args:
             ranks (List[int]) : a list ranks to select traces for construct the call stacks.
+            filter_func (Callable) : used to preprocess the trace events and filter events out. Please see filters in hta/common/trace_filter.py for details.
         """
         call_stack_ids: List[CallStackIdentity] = []
         t0 = perf_counter()
@@ -476,7 +498,7 @@ class CallGraph:
                     # Filter out gpu annotations and sync events
                     df_thread = df_thread[df_thread["stream"].gt(0)]
                 csi = CallStackIdentity(rank, pid, tid)
-                csg = CallStackGraph(df_thread, csi)
+                csg = CallStackGraph(df_thread, csi, filter_func)
                 self.call_stacks.append(csg)
                 call_stack_ids.append(csi)
         t1 = perf_counter()
@@ -494,14 +516,11 @@ class CallGraph:
             }
         )
 
-        # add depth information to the data frame
+        # add depth and parent information to the data frame
         for rank in ranks:
             call_stack_indices = self.mapping[self.mapping["rank"].eq(rank)][
                 "csg_index"
             ]
-            depth = pd.concat(
-                [self.call_stacks[idx].get_depth() for idx in call_stack_indices]
-            )
             parents: Dict[int, int] = {}
             for idx in call_stack_indices:
                 parents.update(
@@ -512,7 +531,11 @@ class CallGraph:
                     }
                 )
             df = self.trace_data.get_trace(rank)
-            df["depth"] = depth
+            if not hta_options.disable_call_graph_depth():
+                depth = pd.concat(
+                    [self.call_stacks[idx].get_depth() for idx in call_stack_indices]
+                )
+                df["depth"] = depth
             index_correlation = df[df["stream"].ne(-1)]["index_correlation"]
             parents.update(index_correlation.to_dict())
             df["parent"] = pd.Series(parents)

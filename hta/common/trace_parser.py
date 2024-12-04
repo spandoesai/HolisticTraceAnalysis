@@ -14,20 +14,25 @@ import tracemalloc
 from collections.abc import Generator
 from typing import Any, Dict, Optional, Tuple
 
+import hta.configs.env_options as hta_options
+
 import numpy as np
 
 import pandas as pd
 from hta.common.trace_symbol_table import TraceSymbolTable
 
 from hta.configs.config import logger
+from hta.configs.default_values import ValueType
 from hta.configs.parser_config import (
     AttributeSpec,
+    DEFAULT_PARSE_VERSION,
     ParserBackend,
     ParserConfig,
-    ValueType,
 )
+from hta.utils.utils import normalize_gpu_stream_numbers
 
 # from memory_profiler import profile
+
 
 MetaData = Dict[str, Any]
 _TRACE_PARSING_BACKEND: Optional[ParserBackend] = None
@@ -260,7 +265,16 @@ def _compress_df(
         )
         # args_to_keep = args_to_keep.union(counter_names)
         cfg.add_args(
-            [AttributeSpec(name, name, ValueType.Int, -1) for name in counter_names]
+            [
+                AttributeSpec(
+                    name,
+                    name,
+                    ValueType.Int,
+                    -1,
+                    min_supported_version=DEFAULT_PARSE_VERSION,
+                )
+                for name in counter_names
+            ]
         )
         logger.info(f"counter_names={counter_names}")
         logger.info(f"args={cfg.get_args()}")
@@ -277,6 +291,8 @@ def _compress_df(
             )
         df.drop(["args"], axis=1, inplace=True)
 
+    normalize_gpu_stream_numbers(df)
+
     # create a local symbol table
     local_symbol_table = TraceSymbolTable()
     symbols = set(df["cat"].unique()).union(set(df["name"].unique()))
@@ -292,6 +308,26 @@ def _compress_df(
             df[col] = pd.to_numeric(df[col], errors="coerce", downcast="integer")
 
     return df, local_symbol_table
+
+
+def round_down_time_stamps(df: pd.DataFrame) -> None:
+    if df["ts"].dtype != np.dtype("float64"):
+        return
+    if hta_options.disable_ns_rounding():
+        logger.warning("Rounding down ns resolution traces disabled")
+        return
+
+    logger.warning(
+        f"Rounding down ns resolution events due to issue with events overlapping."
+        f" ts dtype = {df['ts'].dtype}, dur dtype = {df['dur'].dtype}."
+        f"Please see https://github.com/pytorch/pytorch/pull/122425"
+    )
+    # Don't floor directly, first find the end
+    df["end"] = df["ts"] + df["dur"]
+
+    df["ts"] = df[~df["ts"].isnull()]["ts"].apply(lambda x: math.ceil(x))
+    df["end"] = df[~df["end"].isnull()]["end"].apply(lambda x: math.floor(x))
+    df["dur"] = df["end"] - df["ts"]
 
 
 # @profile
@@ -313,18 +349,7 @@ def _parse_trace_dataframe_json(
     local_symbol_table: TraceSymbolTable = TraceSymbolTable()
     if "traceEvents" in trace_record:
         df = pd.DataFrame(trace_record["traceEvents"])
-        if df["ts"].dtype == np.dtype("float64"):
-            logger.warning(
-                f"Rounding down ns resolution events due to issue with events overlapping."
-                f" ts dtype = {df['ts'].dtype}, dur dtype = {df['dur'].dtype}."
-                f"Please see https://github.com/pytorch/pytorch/pull/122425"
-            )
-            # Don't floor directly, first find the end
-            df["end"] = df["ts"] + df["dur"]
-
-            df["ts"] = df[~df["ts"].isnull()]["ts"].apply(lambda x: math.ceil(x))
-            df["end"] = df[~df["end"].isnull()]["end"].apply(lambda x: math.floor(x))
-            df["dur"] = df["end"] - df["ts"]
+        round_down_time_stamps(df)
 
         # assign an index to each event
         df.reset_index(inplace=True)
@@ -368,6 +393,8 @@ def _parse_trace_dataframe_ijson(
         df = _parse_trace_events_ijson_batched(trace_file_path, cfg, compress_on_fly)
     else:
         df = _parse_trace_events_ijson(trace_file_path)
+
+    round_down_time_stamps(df)
 
     # assign an index to each event
     df.reset_index(inplace=True)
@@ -490,12 +517,22 @@ def parse_metadata_ijson(fh: io.BufferedIOBase) -> MetaData:
         Recursively handles events for a nested map like distributedInfo.
         """
         prefix, event, value = next(generator)
-        logger.debug(" -> ", prefix, event, value)
+        logger.debug(" -> ", prefix, event, value, key, meta_so_far)
         if event == "end_map":
             return meta_so_far
         elif event == "map_key":
             key = value
             return handle_nested_map(generator, key, meta_so_far)
+        elif event == "start_map" or event == "start_array":
+            # Currently we do not supported nesting of maps/arrays in the nested map
+            # skip to end of this section
+            meta_so_far[key] = None
+
+            end_prefix = prefix
+            while not (prefix == end_prefix and event in ["end_map", "end_array"]):
+                logger.debug("  skipping ", prefix, event, value)
+                prefix, event, _ = next(trace_parser)
+            return handle_nested_map(generator, "", meta_so_far)
         else:
             assert (
                 key is not None
@@ -521,11 +558,12 @@ def parse_metadata_ijson(fh: io.BufferedIOBase) -> MetaData:
         # Handle a nested array map like "deviceProperties"
         if prefix == cur_key and event == "start_array":
             meta[cur_key] = []
-            # this should be start_map
+            # For deviceProperties this should be start_map or end_array
             _, _event_, _ = next(trace_parser)
-            assert (
-                _event_ == "start_map"
-            ), f"We only support an array with map elements like deviceProperties, (prefix, event, value) = ({prefix}, {event}, {value})"
+            assert _event_ in [
+                "start_map",
+                "end_array",
+            ], f"We only support an array with map elements like deviceProperties, (prefix, event, value) = ({prefix}, {event}, {value})"
             while _event_ != "end_array":
                 nested_map = {}
                 nested_map = handle_nested_map(trace_parser, "", nested_map)
